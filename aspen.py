@@ -4,6 +4,14 @@ from androidtv import setup
 import subprocess
 import sqlite3
 import logging
+import argparse
+
+# --- Argumentos ---
+parser = argparse.ArgumentParser(description="Controla el volumen de la TV según horario y registra canciones de Aspen 102.3")
+parser.add_argument("--initial-volume", type=int, default=None, help="Volumen inicial de referencia")
+args = parser.parse_args()
+
+INITIAL_VOLUME = args.initial_volume
 
 # --- Configuración ---
 TV_HOST = "192.168.1.129"
@@ -11,7 +19,7 @@ ADB_PORT = 5555
 REDUCTION_FACTOR = 0.2
 MARGIN_SECONDS = 10
 STEP_DELAY = 0.3
-CHECK_SONG_EVERY = 5  # segundos
+CHECK_SONG_EVERY = 10  # segundos
 STREAM_URL = "https://playerservices.streamtheworld.com/api/livestream-redirect/ASPEN.mp3?dist=infobae"
 
 VOLUME_SCHEDULE = {
@@ -33,6 +41,8 @@ logging.basicConfig(
     format='[%(asctime)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+logging.info("Programa de control de volumen de TV según horario y registro de canciones de Aspen 102.3.")
+logging.info("Cada canción se registra en SQLite y el volumen se reduce gradualmente durante periodos programados.")
 
 # --- Base de datos SQLite ---
 conn = sqlite3.connect("songs.db")
@@ -83,20 +93,33 @@ def get_current_song():
         print(str(ex))
         return None
 
+def get_last_logged_song():
+    cursor.execute("SELECT title FROM songs ORDER BY id DESC LIMIT 1")
+    row = cursor.fetchone()
+    return row[0] if row else None
+
 def log_song(song_title):
+    last_title = get_last_logged_song()
+    if last_title == song_title:
+        return False
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute("INSERT INTO songs (timestamp, title) VALUES (?, ?)", (timestamp, song_title))
     conn.commit()
+    logging.info(f"Sonando ahora: {song_title}")
+    return True
 
 # --- Main ---
 def main():
     tv = setup(f"{TV_HOST}", adb_server_ip="127.0.0.1")
 
     muted = False
-    original_volume = None
+    original_volume = INITIAL_VOLUME  # si se pasa como parámetro, se usa
     last_song = None
     silence_applied_for_song = None
     last_song_check = time.time()
+
+    if original_volume is not None:
+        logging.info(f"Volumen inicial configurado a {original_volume}")
 
     try:
         while True:
@@ -108,29 +131,30 @@ def main():
                 last_song_check = time.time()
 
                 if current_song and current_song != last_song:
-                    log_song(current_song)
-                    logging.info(f"Sonando ahora: {current_song}")
-                    last_song = current_song
-                    silence_applied_for_song = False  # reinicia flag
+                    if log_song(current_song):
+                        last_song = current_song
+                        silence_applied_for_song = False  # reinicia flag
 
-                    # Si estaba silenciado, restaurar volumen
-                    if muted:
-                        current_vol = tv.volume() or 0
-                        if original_volume is not None:
-                            gradual_volume(tv, current_vol, original_volume)
-                            logging.info(f"Volumen restaurado por cambio de canción a {original_volume}")
-                        muted = False
+                        if muted:
+                            current_vol = tv.volume() or 0
+                            if original_volume is not None:
+                                gradual_volume(tv, current_vol, original_volume)
+                                logging.info(f"Volumen restaurado por cambio de canción a {original_volume}")
+                            # No cambiar muted a False, solo resetear el flag de la canción
 
             # --- Control de volumen por horario ---
             if is_within_scheduled_interval(now):
                 if not muted and not silence_applied_for_song:
                     current_vol = tv.volume() or 0
-                    original_volume = current_vol
+                    if original_volume is None:
+                        original_volume = current_vol
                     reduced = max(1, int(original_volume * REDUCTION_FACTOR))
-                    gradual_volume(tv, current_vol, reduced)
-                    muted = True
-                    silence_applied_for_song = True
-                    logging.info(f"Volumen bajado gradualmente a {reduced} (original {original_volume})")
+
+                    if current_vol > reduced:
+                        gradual_volume(tv, current_vol, reduced)
+                        muted = True
+                        silence_applied_for_song = True
+                        logging.info(f"Volumen bajado gradualmente a {reduced} (original {original_volume})")
             else:
                 if muted:
                     current_vol = tv.volume() or 0
@@ -148,5 +172,4 @@ def main():
         conn.close()
 
 if __name__ == "__main__":
-    logging.info("Iniciando control de volumen con horarios y registro de canciones...")
     main()
